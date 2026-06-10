@@ -1157,14 +1157,7 @@ class GameBoard(QWidget):
                         self.status_lbl.setText(f"等待 {turn_str} 落子")
 
     def shake_board(self, intensity=4, duration=150):
-        self.board_shake_step = 0
-        self.board_shake_max = duration // 15
-        self.board_shake_intensity = intensity
-        self.board_base_pos = self.view.pos()
-        
-        self.board_shake_timer = QTimer(self)
-        self.board_shake_timer.timeout.connect(self._do_board_shake)
-        self.board_shake_timer.start(15)
+        return  # 已停用震動效果，避免影響報告展示
         
     def _do_board_shake(self):
         self.board_shake_step += 1
@@ -1345,14 +1338,7 @@ class AlphaZeroApp(QMainWindow):
         self.stack.setCurrentWidget(self.menu_page)
 
     def shake(self, intensity=10, duration=300):
-        self.shake_anim_step = 0
-        self.shake_max_steps = duration // 15
-        self.shake_intensity = intensity
-        self.base_pos = self.pos()
-        
-        self.shake_timer = QTimer(self)
-        self.shake_timer.timeout.connect(self._do_shake)
-        self.shake_timer.start(15)
+        return  # 已停用震動效果，避免影響報告展示
         
     def _do_shake(self):
         self.shake_anim_step += 1
