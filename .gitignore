@@ -45,3 +45,7 @@ env/
 dist/
 build/
 *.egg-info/
+
+# --- 測試與日誌產物 ---
+checkpoints_test/
+*.log

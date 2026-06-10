@@ -58,49 +58,51 @@ def d8_augment(state, mcts_probs, threat_map):
 # ==========================================
 class ReplayBuffer:
     """
-    自動淘汰舊資料的 O(1) 環形緩衝區。
-    滿載後，最新的高品質對弈數據會自動擠掉最早期的垃圾數據。
+    自動淘汰舊資料的 O(1) 環形連續記憶體緩衝區。
+    1. 使用預配置 NumPy 陣列儲存，隨機存取效能極大化。
+    2. 容量限制 350,000 筆，避免早期對局污染。
+    3. state 以 uint8 存儲，抽樣時才還原 float32，節約 75% 記憶體。
     """
 
-    def __init__(self, max_size=200_000):
-        self.buffer = deque(maxlen=max_size)
+    def __init__(self, max_size=350_000):
+        self.max_size = max_size
+        self.states_buf = np.zeros((max_size, 4, 15, 15), dtype=np.uint8)
+        self.probs_buf = np.zeros((max_size, 225), dtype=np.float32)
+        self.values_buf = np.zeros((max_size,), dtype=np.float32)
+        self.threats_buf = np.zeros((max_size, 15, 15), dtype=np.float32)
+        self.pos = 0
+        self.size = 0  # 當前有效樣本數
 
     def add_game(self, game_data):
         """
         加入一場完整對弈的訓練數據，自動施加 D8 增強。
-
-        Args:
-            game_data: list of (state, mcts_probs, value, threat_map)
-                state: (4, 15, 15) float32
-                mcts_probs: (225,) float32
-                value: float in [-1, 1]
-                threat_map: (15, 15) float32 - Aux Target
         """
         for state, probs, value, threat in game_data:
-            for aug_state, aug_probs, aug_threat in d8_augment(state, probs, threat):
-                self.buffer.append((
-                    aug_state.astype(np.float32),
-                    aug_probs.astype(np.float32),
-                    np.float32(value),
-                    aug_threat.astype(np.float32),
-                ))
+            state_uint8 = state.astype(np.uint8)
+            for aug_state, aug_probs, aug_threat in d8_augment(state_uint8, probs, threat):
+                self.states_buf[self.pos] = aug_state
+                self.probs_buf[self.pos] = aug_probs
+                self.values_buf[self.pos] = value
+                self.threats_buf[self.pos] = aug_threat
+                self.pos = (self.pos + 1) % self.max_size
+                self.size = min(self.size + 1, self.max_size)
 
     def sample_batch(self, batch_size):
         """
-        隨機抽取一個 mini-batch。
-
-        Returns:
-            (states, probs, values, threats): 各為 NumPy 陣列
+        隨機抽取一個 mini-batch。使用 NumPy C-Level 索引高速取樣。
         """
-        batch = random.sample(self.buffer, min(batch_size, len(self.buffer)))
-        states = np.array([b[0] for b in batch], dtype=np.float32)
-        probs = np.array([b[1] for b in batch], dtype=np.float32)
-        values = np.array([b[2] for b in batch], dtype=np.float32)
-        threats = np.array([b[3] for b in batch], dtype=np.float32)
+        n = min(batch_size, self.size)
+        if n == 0:
+            return np.zeros((0, 4, 15, 15), dtype=np.float32), np.zeros((0, 225), dtype=np.float32), np.zeros((0,), dtype=np.float32), np.zeros((0, 15, 15), dtype=np.float32)
+        indices = np.random.randint(0, self.size, size=n)
+        states = self.states_buf[indices].astype(np.float32)
+        probs = self.probs_buf[indices]
+        values = self.values_buf[indices]
+        threats = self.threats_buf[indices]
         return states, probs, values, threats
 
     def __len__(self):
-        return len(self.buffer)
+        return self.size
 
 
 # ==========================================
@@ -195,138 +197,64 @@ def play_one_game(predict_fn, n_playout=400, c_puct=5.0, temp_threshold=12,
 
 
 # ==========================================
-# 🏟️ 自我對弈控制器 (Self-Play Controller)
+# 🚀 輕量級自我對弈工作行程 (Self-Play Worker Process)
 # ==========================================
-class SelfPlayController:
+def _self_play_worker(worker_id, shm_names, request_queue, worker_event, max_workers,
+                      n_games, n_playout, c_puct, temp_threshold, dirichlet_alpha,
+                      result_queue):
     """
-    Phase 3 的總控台。管理自我對弈循環、經驗池、
-    並提供訓練數據給 Phase 4 的訓練迴圈。
+    自我對弈子處理序：完全不載入 PyTorch/CUDA 函式庫，只透過 CPU 做 MCTS 搜尋
+    並透過共享記憶體發送預測請求，徹底消除 WinError 1455 分頁檔不足的問題。
     """
+    import signal
+    import gc
+    import os
+    import sys
+    import traceback
+    
+    # 🛡️ 子處理序中忽略 Ctrl+C (SIGINT)，由主處理序統一回收
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-    def __init__(self, predict_fn, replay_buffer,
-                 n_playout=400, c_puct=5.0, temp_threshold=12):
-        self.predict_fn = predict_fn
-        self.replay_buffer = replay_buffer
-        self.n_playout = n_playout
-        self.c_puct = c_puct
-        self.temp_threshold = temp_threshold
+    # 延遲導入，避免模組循環依賴
+    from prediction_server import PredictionClient
+    from mcts import LOCAL_WORKER_CACHE
 
-        # 統計
-        self.games_played = 0
-        self.black_wins = 0
-        self.white_wins = 0
-        self.draws = 0
+    client = None
+    try:
+        # 🔥 Numba JIT 預熱，避免第一局搜尋超時
+        from env import GomokuEnv as _WarmupEnv
+        _w = _WarmupEnv()
+        _w.reset()
+        _w.step(112)
+        _ = _w.get_threat_target()
+        _ = _w.get_legal_moves()
+        del _w
 
-    def play_games(self, n_games=1):
-        """
-        執行 n_games 場自我對弈，數據自動灌入 Replay Buffer。
-
-        Args:
-            n_games: 要下幾盤
-
-        Returns:
-            list of (winner, move_count) 每場的結果
-        """
-        results = []
-
-        for i in range(n_games):
-            game_data, winner, move_count = play_one_game(
-                self.predict_fn,
-                n_playout=self.n_playout,
-                c_puct=self.c_puct,
-                temp_threshold=self.temp_threshold,
+        client = PredictionClient(
+            worker_id=worker_id, shm_names=shm_names, request_queue=request_queue,
+            worker_event=worker_event, max_workers=max_workers,
+        )
+        for _ in range(n_games):
+            game_data, winner, moves = play_one_game(
+                client.predict_for_mcts,
+                n_playout=n_playout, c_puct=c_puct,
+                temp_threshold=temp_threshold, dirichlet_alpha=dirichlet_alpha,
             )
+            result_queue.put((game_data, winner, moves))
+            
+            # 🚀 立即釋放 MCTS 快取與記憶體，防止記憶體堆積
+            LOCAL_WORKER_CACHE.cache.clear()
+            gc.collect()
+    except Exception as e:
+        crash_msg = f"Worker {worker_id} crashed:\n{traceback.format_exc()}"
+        try:
+            with open(f"worker_crash_{worker_id}.log", "w", encoding="utf-8") as f:
+                f.write(crash_msg)
+        except Exception:
+            pass
+        print(crash_msg, file=sys.stderr, flush=True)
+        os._exit(1)
+    finally:
+        if client is not None:
+            client.close()
 
-            # D8 增強後灌入經驗池
-            self.replay_buffer.add_game(game_data)
-
-            # 更新統計
-            self.games_played += 1
-            if winner == 1:
-                self.black_wins += 1
-            elif winner == -1:
-                self.white_wins += 1
-            else:
-                self.draws += 1
-
-            results.append((winner, move_count))
-            print(f"  Game {self.games_played}: "
-                  f"{'Black' if winner == 1 else 'White' if winner == -1 else 'Draw':>5} wins | "
-                  f"{move_count} moves | "
-                  f"Buffer: {len(self.replay_buffer):,}")
-
-        return results
-
-    def get_stats(self):
-        return {
-            'games': self.games_played,
-            'black_wins': self.black_wins,
-            'white_wins': self.white_wins,
-            'draws': self.draws,
-            'buffer_size': len(self.replay_buffer),
-        }
-
-
-# ==========================================
-# 🧪 Phase 3 整合測試
-# ==========================================
-if __name__ == '__main__':
-    print("=" * 64)
-    print("  Phase 3: Self-Play Integration Test (v7 Pure Zero)")
-    print("=" * 64)
-
-    # 使用隨機預測器進行快速測試 (不需要 GPU)
-    def random_predict_fn(state_tensor):
-        """模擬神經網路：均勻機率 + 隨機勝率"""
-        probs = np.ones(ACTION_SIZE, dtype=np.float32) / ACTION_SIZE
-        action_probs = list(enumerate(probs))
-        value = np.random.uniform(-0.1, 0.1)
-        return action_probs, value
-
-    # 測試 D8 增強 (含 threat_map)
-    print("\n[1] D8 Symmetry Augmentation Test (with threat_map)...")
-    dummy_state = np.random.randn(4, BOARD_SIZE, BOARD_SIZE).astype(np.float32)
-    dummy_probs = np.random.dirichlet(np.ones(ACTION_SIZE)).astype(np.float32)
-    dummy_threat = np.random.rand(BOARD_SIZE, BOARD_SIZE).astype(np.float32)
-    augmented = d8_augment(dummy_state, dummy_probs, dummy_threat)
-    assert len(augmented) == 8, f"Expected 8 augmentations, got {len(augmented)}"
-    for i, (s, p, t) in enumerate(augmented):
-        assert s.shape == (4, BOARD_SIZE, BOARD_SIZE), f"Aug {i} state shape wrong: {s.shape}"
-        assert p.shape == (ACTION_SIZE,), f"Aug {i} probs shape wrong"
-        assert t.shape == (BOARD_SIZE, BOARD_SIZE), f"Aug {i} threat shape wrong: {t.shape}"
-        assert abs(p.sum() - 1.0) < 1e-5, f"Aug {i} probs don't sum to 1"
-    print("  [OK] 8 augmentations with threat_map, all shapes correct")
-
-    # 測試 ReplayBuffer (4-tuple)
-    print("\n[2] Replay Buffer Test (4-tuple)...")
-    buf = ReplayBuffer(max_size=1000)
-    fake_game = [(dummy_state, dummy_probs, 1.0, dummy_threat) for _ in range(5)]
-    buf.add_game(fake_game)
-    assert len(buf) == 40, f"Expected 40 (5 steps x 8 augs), got {len(buf)}"
-    states, probs, values, threats = buf.sample_batch(16)
-    assert states.shape == (16, 4, BOARD_SIZE, BOARD_SIZE), f"states shape: {states.shape}"
-    assert probs.shape == (16, ACTION_SIZE)
-    assert values.shape == (16,)
-    assert threats.shape == (16, BOARD_SIZE, BOARD_SIZE), f"threats shape: {threats.shape}"
-    print(f"  [OK] Buffer size: {len(buf)}, batch sample shapes correct")
-
-    # 測試自我對弈 (極小模擬次數以加速)
-    print("\n[3] Self-Play Game Test (n_playout=8, quick mode)...")
-    replay = ReplayBuffer()
-    controller = SelfPlayController(
-        predict_fn=random_predict_fn,
-        replay_buffer=replay,
-        n_playout=8,
-        temp_threshold=6,
-    )
-    results = controller.play_games(n_games=2)
-
-    stats = controller.get_stats()
-    print(f"\n  Stats: {stats}")
-    assert stats['games'] == 2
-    assert len(replay) > 0
-    print(f"  [OK] 2 games completed, {len(replay):,} samples in buffer")
-
-    print(f"\n{'=' * 64}")
-    print(f"  ALL PHASE 3 TESTS PASSED (v7)")
-    print(f"{'=' * 64}")

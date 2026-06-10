@@ -89,6 +89,7 @@ class GomokuEnv(gym.Env):
         self.done = False
         self.winner = 0
         self.zobrist_hash = np.int64(0)  # 64-bit 增量哈希
+        self.stone_count = 0  # O(1) 滿盤判斷計數器
 
     def clone(self):
         new_env = GomokuEnv()
@@ -98,6 +99,7 @@ class GomokuEnv(gym.Env):
         new_env.done = self.done
         new_env.winner = self.winner
         new_env.zobrist_hash = self.zobrist_hash
+        new_env.stone_count = self.stone_count
         return new_env
 
     def reset(self):
@@ -107,6 +109,7 @@ class GomokuEnv(gym.Env):
         self.done = False
         self.winner = 0
         self.zobrist_hash = np.int64(0)
+        self.stone_count = 0
         return self._get_obs()
 
     def step(self, action):
@@ -122,12 +125,13 @@ class GomokuEnv(gym.Env):
         # 1. 執行落子
         self.board[x, y] = self.current_player
         self.last_move = action
+        self.stone_count += 1
         
         # 2. 增量 Zobrist Hash (只需一次 XOR，O(1))
         player_idx = 0 if self.current_player == 1 else 1
         self.zobrist_hash ^= ZOBRIST_TABLE[player_idx, x, y]
         
-        # 2. 勝負與禁手判定
+        # 3. 勝負與禁手判定
         is_win, is_forbidden = _check_win_and_forbidden(self.board, x, y, self.current_player)
         
         reward = 0
@@ -140,8 +144,8 @@ class GomokuEnv(gym.Env):
             self.winner = self.current_player
             reward = 1.0
         else:
-            # 檢查是否平手 (滿盤)，O(1) 效能
-            if not np.any(self.board == 0):
+            # 檢查是否平手 (滿盤)，O(1)
+            if self.stone_count >= 225:
                 self.done = True
                 self.winner = 0
             else:
@@ -165,6 +169,7 @@ class GomokuEnv(gym.Env):
         # 落子
         self.board[x, y] = self.current_player
         self.last_move = action
+        self.stone_count += 1
 
         # 增量 Zobrist Hash
         player_idx = 0 if self.current_player == 1 else 1
@@ -182,11 +187,37 @@ class GomokuEnv(gym.Env):
             self.done = True
             self.winner = self.current_player
         else:
-            if not np.any(self.board == 0):
+            if self.stone_count >= 225:
                 self.done = True
                 self.winner = 0
             else:
                 self.current_player *= -1
+
+    def undo_move(self, action, saved_state):
+        """
+        反轉一次 step_fast() 呼叫，將棋盤恢復至落子前的精確狀態。
+        供 MCTS make/undo 模式使用，消除 env.clone() 的 Python 物件建構開銷。
+
+        Args:
+            action: 要撤銷的落子 (0-224)
+            saved_state: step_fast 前擷取的 (last_move, done, winner, current_player) 四元組
+        """
+        x, y = action // self.board_size, action % self.board_size
+        prev_last_move, prev_done, prev_winner, prev_player = saved_state
+
+        # 反轉 Zobrist Hash (XOR 自逆)
+        player_idx = 0 if prev_player == 1 else 1
+        self.zobrist_hash ^= ZOBRIST_TABLE[player_idx, x, y]
+
+        # 移除棋子
+        self.board[x, y] = 0
+        self.stone_count -= 1
+
+        # 恢復狀態
+        self.last_move = prev_last_move
+        self.done = prev_done
+        self.winner = prev_winner
+        self.current_player = prev_player
 
     def _get_obs(self):
         """生成 4ch 觀測矩陣 Tensor（統一入口）"""

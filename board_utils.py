@@ -129,28 +129,36 @@ def _verify_suspect_three(board, x, y, dx, dy, color):
     """
     ray = _get_ray(board, x, y, dx, dy)
 
+    # ⚡ 用定長 NumPy 陣列取代 Python List，避免 Reflected List 記憶體洩漏與 GC 開銷
+    candidate_offsets = np.zeros(4, dtype=np.int8) 
+    candidate_count = 0
+
     # 找出包含中心 (ray[4]) 的長度 5 窗口中，能形成四的空位
-    candidate_offsets = []  # 相對於中心的偏移量
-    for i in range(max(0, 4 - 4), min(5, 4 + 1)):  # 窗口起點 0~4
+    for i in range(0, 5):  # 窗口起點 0~4
         stones = 0
         empty = 0
-        empty_offset = -1
         for j in range(i, i + 5):
             if ray[j] == color:
                 stones += 1
             elif ray[j] == 0:
                 empty += 1
-                empty_offset = j
-        # 3 己方 + 2 空位 → 填入一顆後變成 4+1 = 四
-        # 但我們要確保 ray[4] 在窗口內且是己方棋
+        
         if stones == 3 and empty == 2:
-            # 這個窗口有兩個空位，找出不是 ray[4] 位置的空位作為候選
             for j in range(i, i + 5):
                 if ray[j] == 0 and j != 4:  # 排除中心本身(已落子)
-                    candidate_offsets.append(j - 4)
+                    offset = j - 4
+                    # 去重檢查
+                    exists = False
+                    for c_idx in range(candidate_count):
+                        if candidate_offsets[c_idx] == offset:
+                            exists = True
+                            break
+                    if not exists and candidate_count < 4:
+                        candidate_offsets[candidate_count] = offset
+                        candidate_count += 1
 
-    # 也檢查長度 5 中 4+1 的情況（直接延伸成四）
-    for i in range(max(0, 4 - 4), min(5, 4 + 1)):
+    # 檢查長度 5 中 4+1 的情況（直接延伸成四）
+    for i in range(0, 5):
         stones = 0
         empty_j = -1
         for j in range(i, i + 5):
@@ -158,14 +166,23 @@ def _verify_suspect_three(board, x, y, dx, dy, color):
                 stones += 1
             elif ray[j] == 0:
                 empty_j = j
-        if stones == 4 and empty_j >= 0:
-            candidate_offsets.append(empty_j - 4)
+        if stones == 4 and empty_j >= 0 and empty_j != 4:
+            offset = empty_j - 4
+            exists = False
+            for c_idx in range(candidate_count):
+                if candidate_offsets[c_idx] == offset:
+                    exists = True
+                    break
+            if not exists and candidate_count < 4:
+                candidate_offsets[candidate_count] = offset
+                candidate_count += 1
 
-    if len(candidate_offsets) == 0:
+    if candidate_count == 0:
         return False  # 無法成四 → 假活三
 
     # 對每個候選空位做虛擬落子
-    for offset in candidate_offsets:
+    for c_idx in range(candidate_count):
+        offset = candidate_offsets[c_idx]
         mx = x + offset * dx
         my = y + offset * dy
         if 0 <= mx < 15 and 0 <= my < 15 and board[mx, my] == 0:
